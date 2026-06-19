@@ -18,7 +18,20 @@ import (
 // Dispatcher 由 Dispatcher 层实现，Scheduler 仅负责“扫描到期任务并投递”。
 type Dispatcher interface {
 	Submit(ctx context.Context, task model.Task) bool
+	QueueLoad() float64
+	QueueLen() int
+	QueueCap() int
 }
+
+// 调度公平性与背压阈值
+const (
+	// 队列负载超过此阈值，停止拉取 FAILED 重试任务（只放行 PENDING 新任务）
+	highLoadThreshold = 0.7
+	// 队列负载超过此阈值，连 PENDING 也停止拉取（极端背压）
+	extremeLoadThreshold = 0.95
+	// 新任务配额占比：PENDING 永远先占 BatchSize 的 pendingRatio（保留带宽给新任务）
+	pendingRatio = 0.7
+)
 
 type Scheduler struct {
 	taskRepo    repository.TaskRepository
@@ -137,33 +150,68 @@ func (s *Scheduler) Stop() {
 	}
 }
 
-// tick 单次扫描：先回收卡死的 dispatched 任务，再拉取到期任务并提交给 Dispatcher。
+// tick 单次扫描：先回收卡死任务，再按队列水位与优先级规则调度。
+// 核心公平性规则：
+//   - 负载 > 95% ：不拉任何任务（让系统先排空）
+//   - 负载 > 70% ：只拉 PENDING 新任务（重试让路）
+//   - 负载 <= 70%：PENDING 先占 70% 配额，剩余配额给 FAILED 重试
 func (s *Scheduler) tick(ctx context.Context) {
 	s.reapStuck(ctx)
 
-	now := time.Now()
-	tasks, err := s.taskRepo.FetchDispatchable(ctx, now, s.cfg.BatchSize)
-	if err != nil {
-		s.log.Error("fetch dispatchable tasks failed", zap.Error(err))
-		return
-	}
-	if len(tasks) == 0 {
+	load := s.dispatcher.QueueLoad()
+	// 极端背压：完全暂停调度，让 worker 先把队列清空
+	if load >= extremeLoadThreshold {
+		s.log.Warn("queue under extreme pressure, skip tick",
+			zap.Int("queue_len", s.dispatcher.QueueLen()),
+			zap.Int("queue_cap", s.dispatcher.QueueCap()),
+			zap.Float64("load", load))
 		return
 	}
 
-	submitted, dropped := 0, 0
+	now := time.Now()
+	pendingQuota := int(float64(s.cfg.BatchSize) * pendingRatio)
+	remainingQuota := s.cfg.BatchSize
+
+	// --- 阶段 1：PENDING 新任务，永远优先 ---
+	pending, err := s.taskRepo.FetchPending(ctx, now, pendingQuota)
+	if err != nil {
+		s.log.Error("fetch pending tasks failed", zap.Error(err))
+		// PENDING 失败不阻断 FAILED，继续往下
+	} else {
+		pendingSubmitted := s.batchSubmit(ctx, pending)
+		remainingQuota -= pendingSubmitted
+	}
+
+	// --- 阶段 2：FAILED 重试任务，仅在低负载时放行 ---
+	if load < highLoadThreshold && remainingQuota > 0 {
+		failed, err := s.taskRepo.FetchFailed(ctx, now, remainingQuota)
+		if err != nil {
+			s.log.Error("fetch failed tasks failed", zap.Error(err))
+		} else {
+			s.batchSubmit(ctx, failed)
+		}
+	} else if load >= highLoadThreshold {
+		s.log.Info("skip fetching failed tasks under high load",
+			zap.Float64("load", load),
+			zap.Float64("high_load_threshold", highLoadThreshold))
+	}
+}
+
+// batchSubmit 批量提交到队列，返回实际入队数。
+func (s *Scheduler) batchSubmit(ctx context.Context, tasks []model.Task) int {
+	submitted := 0
 	for _, t := range tasks {
-		// Submit 内部做背压：通道满则返回 false，跳过本次（下个 tick 再取）。
 		if s.dispatcher.Submit(ctx, t) {
 			submitted++
 		} else {
-			dropped++
+			// 队列满，剩下的全部丢弃（下个 tick 再来），避免反复尝试
+			s.log.Debug("queue full, drop remaining tasks in batch",
+				zap.String("task_key", t.TaskKey),
+				zap.Int("dropped_total", len(tasks)-submitted))
+			break
 		}
 	}
-	s.log.Info("tick dispatched",
-		zap.Int("fetched", len(tasks)),
-		zap.Int("submitted", submitted),
-		zap.Int("backpressure_dropped", dropped))
+	return submitted
 }
 
 // reapStuck 回收因实例崩溃而卡在 dispatched 状态的任务。

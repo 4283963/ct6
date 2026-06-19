@@ -59,9 +59,16 @@ func (l *redisLocker) Acquire(ctx context.Context, key, token string, ttl time.D
 	}, nil
 }
 
-// AcquireWithRetry 在 timeout 内以 retryInterval 间隔自旋重试。
-func (l *redisLocker) AcquireWithRetry(ctx context.Context, key, token string, ttl, retryInterval, timeout time.Duration) (Release, error) {
+// AcquireWithRetry 在 timeout 内以指数退避的间隔自旋获取锁。
+// 指数退避间隔可避免 thundering herd：大量任务在同一时刻反复打 Redis。
+// 间隔序列约为 baseInterval, 2*baseInterval, 4*baseInterval ...  capped at 500ms。
+func (l *redisLocker) AcquireWithRetry(ctx context.Context, key, token string, ttl, baseInterval, timeout time.Duration) (Release, error) {
+	const maxInterval = 500 * time.Millisecond
 	deadline := time.Now().Add(timeout)
+	interval := baseInterval
+	if interval <= 0 {
+		interval = 10 * time.Millisecond
+	}
 	for {
 		rel, err := l.Acquire(ctx, key, token, ttl)
 		if err == nil {
@@ -76,7 +83,12 @@ func (l *redisLocker) AcquireWithRetry(ctx context.Context, key, token string, t
 		select {
 		case <-ctx.Done():
 			return nil, ctx.Err()
-		case <-time.After(retryInterval):
+		case <-time.After(interval):
+		}
+		// 指数增长，带封顶
+		interval *= 2
+		if interval > maxInterval {
+			interval = maxInterval
 		}
 	}
 }

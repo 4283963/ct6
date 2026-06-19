@@ -22,6 +22,9 @@ type TaskRepository interface {
 	Register(ctx context.Context, t *model.Task) (existing *model.Task, created bool, err error)
 	GetByTaskKey(ctx context.Context, taskKey string) (*model.Task, error)
 	FetchDispatchable(ctx context.Context, now time.Time, batchSize int) ([]model.Task, error)
+	// FetchPending / FetchFailed 分别拉取新任务与重试任务，供 Scheduler 做优先级配比。
+	FetchPending(ctx context.Context, now time.Time, limit int) ([]model.Task, error)
+	FetchFailed(ctx context.Context, now time.Time, limit int) ([]model.Task, error)
 	ClaimForDispatch(ctx context.Context, taskKey string, fromStates []model.TaskState) error
 	MarkSucceeded(ctx context.Context, taskKey string) error
 	MarkFailed(ctx context.Context, taskKey string, attempt int, nextRunAt time.Time, errMsg string) error
@@ -79,12 +82,35 @@ func (r *taskRepo) GetByTaskKey(ctx context.Context, taskKey string) (*model.Tas
 }
 
 // FetchDispatchable 拉取可分发候选：处于 pending/failed 且已到达投递时间。
+// 保留该方法用于只读统计/兼容场景；调度主循环应使用 FetchPending / FetchFailed 精确配比。
 func (r *taskRepo) FetchDispatchable(ctx context.Context, now time.Time, batchSize int) ([]model.Task, error) {
 	var tasks []model.Task
 	err := r.db.WithContext(ctx).
 		Where("state IN ? AND next_run_at <= ?", []model.TaskState{model.StatePending, model.StateFailed}, now).
 		Order("priority DESC, next_run_at ASC").
 		Limit(batchSize).
+		Find(&tasks).Error
+	return tasks, err
+}
+
+// FetchPending 拉取 PENDING 新任务（高优先级），保证新任务不会被重试任务饿死。
+func (r *taskRepo) FetchPending(ctx context.Context, now time.Time, limit int) ([]model.Task, error) {
+	var tasks []model.Task
+	err := r.db.WithContext(ctx).
+		Where("state = ? AND next_run_at <= ?", model.StatePending, now).
+		Order("priority DESC, next_run_at ASC").
+		Limit(limit).
+		Find(&tasks).Error
+	return tasks, err
+}
+
+// FetchFailed 拉取 FAILED 重试任务（低优先级）。
+func (r *taskRepo) FetchFailed(ctx context.Context, now time.Time, limit int) ([]model.Task, error) {
+	var tasks []model.Task
+	err := r.db.WithContext(ctx).
+		Where("state = ? AND next_run_at <= ?", model.StateFailed, now).
+		Order("priority DESC, next_run_at ASC").
+		Limit(limit).
 		Find(&tasks).Error
 	return tasks, err
 }

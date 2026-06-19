@@ -133,7 +133,7 @@ func (c *Config) applyDefaults() {
 		c.MySQL.ConnMaxLifetime = time.Hour
 	}
 	if c.Redis.PoolSize == 0 {
-		c.Redis.PoolSize = 20
+		c.Redis.PoolSize = 200
 	}
 	if c.Redis.LockNamespace == "" {
 		c.Redis.LockNamespace = "td:lock"

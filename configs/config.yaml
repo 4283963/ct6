@@ -19,7 +19,7 @@ redis:
   addr: "127.0.0.1:6379"
   password: ""
   db: 0
-  pool_size: 20
+  pool_size: 200
   lock_namespace: "td:lock"
 
 scheduler:

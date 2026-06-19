@@ -18,6 +18,8 @@ import (
 	"ct6/pkg/retry"
 )
 
+var errCircuitOpen = errors.New("circuit breaker open: downstream is unhealthy, fast-fail")
+
 type Dispatcher struct {
 	taskRepo   repository.TaskRepository
 	execRepo   repository.ExecutionRepository
@@ -27,11 +29,19 @@ type Dispatcher struct {
 	instanceID string
 	backoff    *retry.Backoff
 	workers    int
+	breaker    *circuitBreaker
 	log        *zap.Logger
 
 	queue  chan model.Task
 	stopCh chan struct{}
 }
+
+const (
+	// 熔断器：10s 窗口内 >= 3 次失败即熔断，熔断 10s 后半开探测
+	cbThreshold = 3
+	cbWindow    = 10 * time.Second
+	cbCooldown  = 10 * time.Second
+)
 
 func NewDispatcher(
 	taskRepo repository.TaskRepository,
@@ -54,6 +64,7 @@ func NewDispatcher(
 			cfg.BackoffMultiplier,
 			cfg.JitterRatio,
 		),
+		breaker: newCircuitBreaker(cbThreshold, cbWindow, cbCooldown),
 		log:     logger.L().Named("dispatcher"),
 		queue:   make(chan model.Task, schedCfg.MaxInFlight),
 		workers: schedCfg.WorkerCount,
@@ -85,6 +96,21 @@ func (d *Dispatcher) Submit(ctx context.Context, task model.Task) bool {
 		return false
 	}
 }
+
+// QueueLoad 返回队列当前负载（0.0~1.0），供 Scheduler 做背压感知决策。
+func (d *Dispatcher) QueueLoad() float64 {
+	capacity := cap(d.queue)
+	if capacity == 0 {
+		return 1
+	}
+	return float64(len(d.queue)) / float64(capacity)
+}
+
+// QueueLen 返回队列当前长度。
+func (d *Dispatcher) QueueLen() int { return len(d.queue) }
+
+// QueueCap 返回队列容量。
+func (d *Dispatcher) QueueCap() int { return cap(d.queue) }
 
 func (d *Dispatcher) worker(ctx context.Context, id int) {
 	for {
@@ -121,10 +147,17 @@ func (d *Dispatcher) processTask(ctx context.Context, task model.Task) {
 	}
 
 	lockKey := "dispatch:" + task.TaskKey
-	rel, err := d.locker.AcquireWithRetry(ctx, lockKey, token, d.cfg.LockTTL, 100*time.Millisecond, 2*time.Second)
+	// 关键：获取锁只做一次尝试，失败就放弃。
+	// 失败场景下，多个 worker 并发抢同一批锁时会产生 thundering herd，
+	// 与其自旋 2 秒、反复打 Redis 耗尽连接池，不如让下个 tick（2s）再来。
+	rel, err := d.locker.Acquire(ctx, lockKey, token, d.cfg.LockTTL)
 	if err != nil {
-		d.log.Debug("lock not acquired, skip (another instance handling)",
-			zap.String("task_key", task.TaskKey))
+		if errors.Is(err, lock.ErrLockNotAcquired) {
+			d.log.Debug("lock not acquired, skip (another instance handling)",
+				zap.String("task_key", task.TaskKey))
+		} else {
+			d.log.Warn("acquire lock failed", zap.String("task_key", task.TaskKey), zap.Error(err))
+		}
 		return
 	}
 	defer func() {
@@ -144,6 +177,20 @@ func (d *Dispatcher) processTask(ctx context.Context, task model.Task) {
 		return
 	}
 
+	// 短路：下游熔断打开时直接快速失败，不做长超时占 worker。
+	if !d.breaker.Allow(task.WebhookURL) {
+		thisAttempt := task.Attempt + 1
+		deliveryToken := fmt.Sprintf("%s#%d", task.TaskKey, thisAttempt)
+		d.recordExecution(ctx, task.TaskKey, thisAttempt, deliveryToken, httpclient.Result{
+			Err: errCircuitOpen})
+		d.breaker.Record(task.WebhookURL, false)
+		d.handleFailure(ctx, task, thisAttempt, httpclient.Result{Err: errCircuitOpen})
+		d.log.Warn("circuit breaker open, fast-fail",
+			zap.String("task_key", task.TaskKey),
+			zap.String("host", extractHost(task.WebhookURL)))
+		return
+	}
+
 	thisAttempt := task.Attempt + 1
 	deliveryToken := fmt.Sprintf("%s#%d", task.TaskKey, thisAttempt)
 	headers := d.buildHeaders(task, deliveryToken, thisAttempt)
@@ -155,6 +202,7 @@ func (d *Dispatcher) processTask(ctx context.Context, task model.Task) {
 	d.recordExecution(ctx, task.TaskKey, thisAttempt, deliveryToken, result)
 
 	if result.IsSuccess() {
+		d.breaker.Record(task.WebhookURL, true)
 		if err := d.taskRepo.MarkSucceeded(ctx, task.TaskKey); err != nil {
 			d.log.Error("mark succeeded failed", zap.String("task_key", task.TaskKey), zap.Error(err))
 			return
@@ -167,6 +215,7 @@ func (d *Dispatcher) processTask(ctx context.Context, task model.Task) {
 		return
 	}
 
+	d.breaker.Record(task.WebhookURL, false)
 	d.handleFailure(ctx, task, thisAttempt, result)
 }
 
