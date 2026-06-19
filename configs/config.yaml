@@ -1,0 +1,39 @@
+app:
+  name: "task-dispatcher"
+  environment: "dev"
+  instance_id: ""
+
+http:
+  port: 8080
+  read_timeout: 15s
+  write_timeout: 15s
+  shutdown_timeout: 10s
+
+mysql:
+  dsn: "trader:trader_pwd@tcp(127.0.0.1:3306)/task_dispatcher?charset=utf8mb4&parseTime=True&loc=Local"
+  max_open_conns: 50
+  max_idle_conns: 10
+  conn_max_lifetime: 1h
+
+redis:
+  addr: "127.0.0.1:6379"
+  password: ""
+  db: 0
+  pool_size: 20
+  lock_namespace: "td:lock"
+
+scheduler:
+  tick_interval: 2s
+  batch_size: 100
+  claim_ttl: 30s
+  max_in_flight: 256
+  worker_count: 8
+
+dispatcher:
+  http_timeout: 10s
+  max_retries: 5
+  base_backoff: 1s
+  max_backoff: 5m
+  backoff_multiplier: 2.0
+  jitter_ratio: 0.3
+  lock_ttl: 30s
