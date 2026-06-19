@@ -109,6 +109,20 @@ func (b *circuitBreaker) IsOpen(rawURL string) bool {
 	return s.isOpen && time.Since(s.openedAt) <= b.cooldown
 }
 
+// openCount 返回当前处于打开状态的熔断器数量，用于监控。
+func (b *circuitBreaker) openCount() int {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	now := time.Now()
+	n := 0
+	for _, s := range b.hosts {
+		if s.isOpen && now.Sub(s.openedAt) <= b.cooldown {
+			n++
+		}
+	}
+	return n
+}
+
 func extractHost(rawURL string) string {
 	u, err := url.Parse(rawURL)
 	if err != nil {

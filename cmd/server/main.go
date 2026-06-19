@@ -19,6 +19,7 @@ import (
 	"ct6/internal/config"
 	"ct6/internal/dispatcher"
 	"ct6/internal/lock"
+	"ct6/internal/metrics"
 	"ct6/internal/middleware"
 	"ct6/internal/repository"
 	"ct6/internal/scheduler"
@@ -85,8 +86,11 @@ func main() {
 	// ---- 分布式锁 ----
 	locker := lock.NewRedisLocker(rdb, cfg.Redis.LockNamespace)
 
+	// ---- 实时计数器 (Redis) ----
+	counters := metrics.NewDeliveryCounters(rdb, "td")
+
 	// ---- 业务逻辑层：Dispatcher（先创建，Scheduler 依赖其 Submit） ----
-	disp := dispatcher.NewDispatcher(taskRepo, execRepo, locker, cfg.Dispatcher, cfg.Scheduler, cfg.App.InstanceID)
+	disp := dispatcher.NewDispatcher(taskRepo, execRepo, locker, cfg.Dispatcher, cfg.Scheduler, counters, cfg.App.InstanceID)
 
 	// ---- 业务逻辑层：Scheduler ----
 	sched := scheduler.NewScheduler(taskRepo, disp, cfg.Scheduler, cfg.Dispatcher, cfg.App.InstanceID)
@@ -101,8 +105,10 @@ func main() {
 	// ---- 路由层 ----
 	idemp := middleware.NewIdempotency(rdb, 24*time.Hour)
 	taskH := handler.NewTaskHandler(sched, taskRepo, execRepo)
+	statsSvc := metrics.NewStatsService(counters, execRepo, taskRepo, disp)
+	statsH := handler.NewStatsHandler(statsSvc)
 	healthH := handler.NewHealthHandler(db, rdb)
-	engine := api.NewRouter(cfg, taskH, healthH, idemp)
+	engine := api.NewRouter(cfg, taskH, statsH, healthH, idemp)
 
 	srv := &http.Server{
 		Addr:         fmt.Sprintf(":%d", cfg.HTTP.Port),

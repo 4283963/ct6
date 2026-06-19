@@ -12,6 +12,7 @@ import (
 func NewRouter(
 	cfg *config.Config,
 	taskH *handler.TaskHandler,
+	statsH *handler.StatsHandler,
 	healthH *handler.HealthHandler,
 	idemp *middleware.Idempotency,
 ) *gin.Engine {

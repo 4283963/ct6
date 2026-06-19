@@ -11,6 +11,7 @@ import (
 
 	"ct6/internal/config"
 	"ct6/internal/lock"
+	"ct6/internal/metrics"
 	"ct6/internal/model"
 	"ct6/internal/repository"
 	"ct6/pkg/httpclient"
@@ -30,6 +31,7 @@ type Dispatcher struct {
 	backoff    *retry.Backoff
 	workers    int
 	breaker    *circuitBreaker
+	counters   *metrics.DeliveryCounters
 	log        *zap.Logger
 
 	queue  chan model.Task
@@ -49,6 +51,7 @@ func NewDispatcher(
 	locker lock.Locker,
 	cfg config.DispatcherConfig,
 	schedCfg config.SchedulerConfig,
+	counters *metrics.DeliveryCounters,
 	instanceID string,
 ) *Dispatcher {
 	d := &Dispatcher{
@@ -64,11 +67,12 @@ func NewDispatcher(
 			cfg.BackoffMultiplier,
 			cfg.JitterRatio,
 		),
-		breaker: newCircuitBreaker(cbThreshold, cbWindow, cbCooldown),
-		log:     logger.L().Named("dispatcher"),
-		queue:   make(chan model.Task, schedCfg.MaxInFlight),
-		workers: schedCfg.WorkerCount,
-		stopCh:  make(chan struct{}),
+		breaker:  newCircuitBreaker(cbThreshold, cbWindow, cbCooldown),
+		counters: counters,
+		log:      logger.L().Named("dispatcher"),
+		queue:    make(chan model.Task, schedCfg.MaxInFlight),
+		workers:  schedCfg.WorkerCount,
+		stopCh:   make(chan struct{}),
 	}
 	return d
 }
@@ -111,6 +115,14 @@ func (d *Dispatcher) QueueLen() int { return len(d.queue) }
 
 // QueueCap 返回队列容量。
 func (d *Dispatcher) QueueCap() int { return cap(d.queue) }
+
+// CircuitOpenCount 返回当前打开的熔断器数量（观测用）。
+func (d *Dispatcher) CircuitOpenCount() int {
+	if d.breaker == nil {
+		return 0
+	}
+	return d.breaker.openCount()
+}
 
 func (d *Dispatcher) worker(ctx context.Context, id int) {
 	for {
@@ -184,6 +196,7 @@ func (d *Dispatcher) processTask(ctx context.Context, task model.Task) {
 		d.recordExecution(ctx, task.TaskKey, thisAttempt, deliveryToken, httpclient.Result{
 			Err: errCircuitOpen})
 		d.breaker.Record(task.WebhookURL, false)
+		d.incFailure(0, "circuit")
 		d.handleFailure(ctx, task, thisAttempt, httpclient.Result{Err: errCircuitOpen})
 		d.log.Warn("circuit breaker open, fast-fail",
 			zap.String("task_key", task.TaskKey),
@@ -203,6 +216,7 @@ func (d *Dispatcher) processTask(ctx context.Context, task model.Task) {
 
 	if result.IsSuccess() {
 		d.breaker.Record(task.WebhookURL, true)
+		d.incSuccess(result.StatusCode)
 		if err := d.taskRepo.MarkSucceeded(ctx, task.TaskKey); err != nil {
 			d.log.Error("mark succeeded failed", zap.String("task_key", task.TaskKey), zap.Error(err))
 			return
@@ -215,7 +229,12 @@ func (d *Dispatcher) processTask(ctx context.Context, task model.Task) {
 		return
 	}
 
+	reason := "http"
+	if result.Err != nil {
+		reason = "network"
+	}
 	d.breaker.Record(task.WebhookURL, false)
+	d.incFailure(result.StatusCode, reason)
 	d.handleFailure(ctx, task, thisAttempt, result)
 }
 
@@ -266,10 +285,34 @@ func (d *Dispatcher) recordExecution(ctx context.Context, taskKey string, attemp
 	if err := d.execRepo.Record(ctx, exec); err != nil {
 		if errors.Is(err, repository.ErrDuplicateExecution) {
 			d.log.Warn("duplicate execution record (token existed)", zap.String("delivery_token", token))
+			d.incDuplicate()
 			return
 		}
 		d.log.Error("record execution failed", zap.String("task_key", taskKey), zap.Error(err))
 	}
+}
+
+// incSuccess / incFailure / incDuplicate 统一做空指针兜底 + 异步 fire-and-forget
+// 保证 Redis 计数器故障不影响主流程。
+func (d *Dispatcher) incSuccess(statusCode int) {
+	if d.counters == nil {
+		return
+	}
+	go d.counters.IncSuccess(context.Background(), statusCode)
+}
+
+func (d *Dispatcher) incFailure(statusCode int, reason string) {
+	if d.counters == nil {
+		return
+	}
+	go d.counters.IncFailure(context.Background(), statusCode, reason)
+}
+
+func (d *Dispatcher) incDuplicate() {
+	if d.counters == nil {
+		return
+	}
+	go d.counters.IncDuplicate(context.Background())
 }
 
 // buildHeaders 合并用户自定义 headers 与系统注入的幂等性 headers。
